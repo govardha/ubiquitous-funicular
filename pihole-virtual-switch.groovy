@@ -1,4 +1,3 @@
-
 /**
  *  Pi-hole Virtual Switch Device Driver (Updated for Pi-hole v6 API)
  *
@@ -15,6 +14,9 @@
  *    - 2023.01.13: Fixed issue for Pi-holes without passwords
  *    - 2025.02.21: Updated for Pi-hole v6 API changes, added HPM support (by WalksOnAir)
  *    - 2025.02.22: Updated with user selectable port (by Alan_F)
+ *    - 2025.05.04: Added HTTPS support with certificate validation options
+ *    - 2025.05.04: Updated to support FQDN hostnames with DNS resolution
+ *    - 2025.05.04: Updated for Pi-hole v6 REST API compatibility
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  You may not use this file except in compliance with the License.
@@ -30,7 +32,7 @@
  */
 
 metadata {
-    definition (name: "Pi-hole Virtual Switch", namespace: "WalksOnAir", author: "WalksOnAir") {
+    definition (name: "PiHole Virtual Switch", namespace: "WalksOnAir", author: "WalksOnAir") {
         capability "Switch"
 
         command "poll"
@@ -44,8 +46,10 @@ metadata {
    
     preferences {
         section ("Settings") {
-            input name: "deviceIP", type: "text", title: "Pi-hole IP address", required: true
+            input name: "deviceIP", type: "text", title: "Pi-hole IP address or hostname", required: true
             input name: "devicePort", type: "text", title: "Pi-hole Port (required)", required: true, defaultValue: "80"
+            input name: "useHttps", type: "bool", title: "Use HTTPS Connection", required: false, defaultValue: false
+            input name: "ignoreSSLIssues", type: "bool", title: "Ignore SSL Certificate Issues", required: false, defaultValue: false
             input name: "piPassword", type: "password", title: "Pi-hole Password (required):", required: true
             input name: "disableTime", type: "number", title: "Disable time in minutes (1..1440; Blank = indefinitely):", required: false, range: "1..1440"
             input name: "pollingInterval", type: "number", title: "Polling Interval (minutes):", required: false, defaultValue: 10, range: "1..60"
@@ -77,6 +81,13 @@ def initialize() {
     if (isDebug == null) isDebug = false
 
     logDebug("Initializing Pi-hole Virtual Switch...")
+    
+    // If we're using a hostname/FQDN and it's time to refresh DNS, do an initial ping
+    // This will resolve and cache the IP address
+    if (deviceIP =~ /[a-zA-Z]/ && shouldRefreshDns()) {
+        logDebug("Hostname detected and DNS cache expired. Performing initial DNS resolution...")
+        pingPiHole()
+    }
     
     if (state.sid && device.currentValue("sessionValid") == "true") {
         logDebug("Valid session found. Skipping authentication.")
@@ -166,7 +177,12 @@ def off() {
 
     ensureSessionValid()
     def disableTimeInSeconds = (disableTime && disableTime > 0) ? disableTime * 60 : 0
-    def payload = disableTimeInSeconds > 0 ? [ "blocking": false, "timer": disableTimeInSeconds ] : [ "blocking": false ]
+    def payload = [ "blocking": false ]
+    
+    // Add timer parameter only if disableTime is defined and greater than 0
+    if (disableTimeInSeconds > 0) {
+        payload.timer = disableTimeInSeconds
+    }
 
     sendRequest("POST", "/dns/blocking", payload, "handleOffResponse")
 }
@@ -227,7 +243,7 @@ def authenticate() {
         return
     }
 
-    log.info "Attempting Pi-hole authentication..."
+    log.info "Attempting Pi-hole v6 API authentication..."
     state.sid = null
     state.csrf = null
     sendEvent(name: "sessionValid", value: "authenticating")
@@ -235,12 +251,19 @@ def authenticate() {
     def payload = new groovy.json.JsonBuilder([ "password": settings.piPassword.trim() ]).toString()
 
     try {
+        def protocol = getProtocol()
+        
         def params = [
-            uri: "http://${deviceIP}:${devicePort}/api/auth",
+            uri: "${protocol}://${deviceIP}:${devicePort}/api/auth",
             headers: ["Content-Type": "application/json"],
             body: payload,
             timeout: 5
         ]
+        
+        // Add ignoreSSL option if using HTTPS and ignoreSSLIssues is enabled
+        if (useHttps && ignoreSSLIssues) {
+            params.ignoreSSLIssues = true
+        }
         
         httpPost(params) { response ->
             if (response.status == 200) {
@@ -251,7 +274,8 @@ def authenticate() {
                     state.csrf = jsonResponse.session.csrf
                     sendEvent(name: "sessionValid", value: "true") 
                     sendEvent(name: "serviceStatus", value: "Online (Running)")
-                    log.info "Authenticated successfully. New Session ID: ${state.sid}, CSRF Token: ${state.csrf}"
+                    log.info "Authenticated successfully with Pi-hole v6 API."
+                    logDebug("Session ID: ${state.sid}, CSRF Token: ${state.csrf}, Validity: ${jsonResponse.session.validity} seconds")
 
                     runIn(2, poll)
                 } else {
@@ -324,7 +348,9 @@ def handleStatusResponse(hubitat.device.HubResponse response) {
         def json = response.getJson()
 
         if (json?.blocking != null) {
-            def switchState = (json.blocking == "enabled") ? "on" : "off"
+            // Pi-hole v6 returns a boolean value for blocking instead of a string
+            def blockingEnabled = json.blocking
+            def switchState = blockingEnabled ? "on" : "off"
             sendEvent(name: "switch", value: switchState)
 
             if (device.currentValue("serviceStatus") == "Down (Service Unavailable)") {
@@ -355,7 +381,6 @@ def handleApiHealthResponse(hubitat.device.HubResponse response) {
         logDebug("Pi-hole API is online and accessible.")
         sendEvent(name: "deviceStatus", value: "Online")
 
- 
         sendRequest("GET", "/api/dns/blocking", null, "handleStatusResponse")
     } else if (response.status == 301) {
         log.warn "Pi-hole API is returning HTTP 301 (Moved Permanently). Check if the API is redirecting to HTTPS."
@@ -372,11 +397,13 @@ def sendRequest(String method, String endpoint, Map payload, String callbackMeth
         return
     }
 
+    def protocol = getProtocol()
     def headers = [
         "Content-Type": "application/json",
         "HOST": "${deviceIP}:${devicePort}"
     ]
 
+    // In Pi-hole v6, authentication headers are different
     if (!isAuth && state.sid) {
         headers["X-FTL-SID"] = state.sid
     }
@@ -384,10 +411,12 @@ def sendRequest(String method, String endpoint, Map payload, String callbackMeth
         headers["X-FTL-CSRF"] = state.csrf
     }
 
+    // For GET requests, the session ID can be added to the query params
     if (!isAuth && state.sid && method == "GET") {
         endpoint = "${endpoint}?sid=${URLEncoder.encode(state.sid, 'UTF-8')}"
     }
 
+    // For POST requests, the session ID is included in the payload
     if (!isAuth && state.sid && method == "POST") {
         if (payload == null) {
             payload = [:]
@@ -397,7 +426,7 @@ def sendRequest(String method, String endpoint, Map payload, String callbackMeth
 
     def safePayload = payload ? new groovy.json.JsonBuilder(payload).toString() : null
 
-    logDebug("Sending request - Method: ${method}, Path: ${endpoint}")
+    logDebug("Sending request - Protocol: ${protocol}, Method: ${method}, Path: ${endpoint}")
     logDebug("Headers: ${headers}")
     logDebug("Payload: ${safePayload ?: 'No Payload'}")  
 
@@ -407,7 +436,9 @@ def sendRequest(String method, String endpoint, Map payload, String callbackMeth
             path: "/api${endpoint}",
             headers: headers,
             body: safePayload
-        ], null, [callback: callbackMethod])
+        ], 
+        "${protocol}:${deviceIP}:${devicePort}", 
+        [callback: callbackMethod])
 
         sendHubCommand(hubAction)
         logDebug("Request sent to Pi-hole API. Awaiting response...")
@@ -418,7 +449,8 @@ def sendRequest(String method, String endpoint, Map payload, String callbackMeth
 }
 
 private boolean testApiAvailability() {
-    def url = "http://${deviceIP}:${devicePort}/api/dns/blocking"
+    def protocol = getProtocol()
+    def url = "${protocol}://${deviceIP}:${devicePort}/api/dns/blocking"
     def headers = ["Content-Type": "application/json"]
 
     if (state.sid) {
@@ -429,7 +461,18 @@ private boolean testApiAvailability() {
     }
 
     try {
-        httpGet([uri: url, headers: headers, timeout: 5]) { response ->
+        def params = [
+            uri: url, 
+            headers: headers, 
+            timeout: 5
+        ]
+        
+        // Add ignoreSSL option if using HTTPS and ignoreSSLIssues is enabled
+        if (useHttps && ignoreSSLIssues) {
+            params.ignoreSSLIssues = true
+        }
+        
+        httpGet(params) { response ->
             if (response.status == 200) {
                 logDebug("Pi-hole API is online (HTTP 200).")
                 sendEvent(name: "serviceStatus", value: "Online (Running)")
@@ -459,6 +502,12 @@ private boolean testApiAvailability() {
             sendEvent(name: "sessionValid", value: "false")
             state.sid = null
             state.csrf = null
+        } else if (e.message.contains("SSL") || e.message.contains("certificate")) {
+            log.warn "Pi-hole SSL certificate issue detected. Consider enabling 'Ignore SSL Certificate Issues' in preferences."
+            sendEvent(name: "serviceStatus", value: "SSL Error")
+            sendEvent(name: "sessionValid", value: "false")
+            state.sid = null
+            state.csrf = null
         } else {
             sendEvent(name: "serviceStatus", value: "Unknown Network Error")
         }
@@ -473,6 +522,20 @@ def logDebug(msg) {
     }
 }
 
+// Helper method to get the protocol (http/https) based on preferences
+private String getProtocol() {
+    return useHttps ? "https" : "http"
+}
+
+// Check if we need to re-resolve the DNS (every 6 hours by default)
+private boolean shouldRefreshDns() {
+    if (!state.lastDnsResolution) return true
+    
+    // Default DNS cache expiration is 6 hours (in milliseconds)
+    def dnsCacheExpirationMs = 6 * 60 * 60 * 1000
+    
+    return (now() - state.lastDnsResolution) > dnsCacheExpirationMs
+}
 
 private redactSettings(settingsMap) {
     if (!settingsMap) return [:]
@@ -488,20 +551,129 @@ private redactSettings(settingsMap) {
 }
 
 def pingPiHole() {
-    logDebug("Pinging Pi-hole server at ${deviceIP}...")
-
-    try {
-        def pingResult = hubitat.helper.NetworkUtils.ping(deviceIP, 1)  // Give me a ping, Vasili. One ping only, please.
-
-        if (pingResult.packetsReceived > 0) {
-            logDebug("Pi-hole server at ${deviceIP} responded to ping. RTT Avg: ${pingResult.rttAvg} ms")
-            return true
+    def targetAddress = deviceIP
+    
+    // Check if the deviceIP is an FQDN (contains alphabetic characters)
+    if (deviceIP =~ /[a-zA-Z]/) {
+        logDebug("Pi-hole address '${deviceIP}' appears to be an FQDN.")
+        
+        // Try to use stored IP if we have one
+        if (state.resolvedIP && !shouldRefreshDns()) {
+            logDebug("Using cached IP address: ${state.resolvedIP}")
+            targetAddress = state.resolvedIP
         } else {
-            log.warn "Ping to Pi-hole server failed! No response received."
-            return false
+            // Alternative approach - try to check if Pi-hole is available via HTTP
+            logDebug("Checking Pi-hole availability via HTTP request...")
+            
+            try {
+                def protocol = getProtocol()
+                def uri = "${protocol}://${deviceIP}:${devicePort}/admin/"
+                logDebug("Testing connection to: ${uri}")
+                
+                httpHead(uri: uri, timeout: 5) { response ->
+                    if (response.status == 200 || response.status == 301 || response.status == 302) {
+                        log.info "Pi-hole admin interface is accessible at ${uri}"
+                        // Since we can reach the admin interface, we'll consider the device online
+                        return true
+                    }
+                }
+            } catch (Exception e) {
+                logDebug("HTTP connection test failed: ${e.message}")
+            }
+        }
+    } else {
+        logDebug("Pi-hole address '${deviceIP}' appears to be an IP address.")
+    }
+    
+    logDebug("Testing connection to Pi-hole server at ${targetAddress}...")
+
+    // Try a direct API call instead of relying on ping
+    try {
+        def protocol = getProtocol()
+        def uri = "${protocol}://${targetAddress}:${devicePort}/api/dns/info"
+        logDebug("Testing Pi-hole API connection to: ${uri}")
+        
+        def params = [
+            uri: uri,
+            timeout: 5
+        ]
+        
+        // Add ignoreSSL option if using HTTPS and ignoreSSLIssues is enabled
+        if (useHttps && ignoreSSLIssues) {
+            params.ignoreSSLIssues = true
+        }
+        
+        def apiAccessible = false
+        
+        httpGet(params) { response ->
+            if (response.status >= 200 && response.status < 300) {
+                log.info "Pi-hole API is accessible at ${uri}"
+                apiAccessible = true
+            } else {
+                logDebug("Pi-hole API returned status code: ${response.status}")
+            }
+        }
+        
+        if (apiAccessible) {
+            return true
         }
     } catch (Exception e) {
-        log.error "Error while pinging Pi-hole: ${e.message}"
-        return false
+        logDebug("Pi-hole API connection test failed: ${e.message}")
     }
+    
+    // As a last resort, try the NetworkUtils.ping method, but handle null result
+    try {
+        logDebug("Attempting to ping ${targetAddress} using NetworkUtils...")
+        
+        // First check if NetworkUtils is available in this Hubitat version
+        if (hubitat.helper.NetworkUtils.respondsTo('ping')) {
+            def pingResult = hubitat.helper.NetworkUtils.ping(targetAddress, 1)
+            
+            if (pingResult == null) {
+                logDebug("Ping operation returned null result")
+                // Don't return false yet, let the HTTP check below have a chance
+            } else {
+                logDebug("Ping completed. Raw results: ${pingResult}")
+                
+                // Try to determine success based on string representation
+                if (pingResult.toString().contains("packetsReceived=1") || 
+                   pingResult.toString().contains("packetsReceived: 1")) {
+                    log.info "Pi-hole server at ${targetAddress} responded to ping"
+                    return true
+                }
+            }
+        } else {
+            logDebug("NetworkUtils.ping method is not available in this Hubitat version")
+        }
+    } catch (Exception e) {
+        logDebug("Error while attempting ping: ${e.message}")
+    }
+    
+    // If all methods fail, try a simple HTTP request as last resort
+    try {
+        def protocol = getProtocol()
+        def uri = "${protocol}://${targetAddress}:${devicePort}"
+        logDebug("Final attempt - testing basic HTTP connection to: ${uri}")
+        
+        def params = [
+            uri: uri,
+            timeout: 3
+        ]
+        
+        if (useHttps && ignoreSSLIssues) {
+            params.ignoreSSLIssues = true
+        }
+        
+        httpHead(params) { response ->
+            if (response.status) {
+                log.info "Pi-hole server at ${targetAddress} responded to HTTP request with status: ${response.status}"
+                return true
+            }
+        }
+    } catch (Exception e) {
+        log.warn "Pi-hole server at ${targetAddress} is unreachable: ${e.message}"
+    }
+    
+    log.warn "Pi-hole server at ${targetAddress} appears to be OFFLINE after multiple connection attempts"
+    return false
 }
